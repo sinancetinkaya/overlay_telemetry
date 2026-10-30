@@ -1,0 +1,4 @@
+embed_gopro_telemetry.py
+.vscode/launch.json
+__pycache__/*
+.vscode/*

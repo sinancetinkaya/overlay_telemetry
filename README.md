@@ -174,13 +174,14 @@ the script warns and renders the video without the wind box.
 Convert a Garmin .fit activity file to a .tcx file, keeping every value the TCX format can carry, plus temperature (and optionally any other per-record field) in <Extensions>.
 
 Usage:
+```
     python3 fit2tcx.py input.fit [output.tcx] [--all-fields]
 
     --all-fields   also dump every remaining record field (including
                    "unknown_*" ones) as <fit:Field name="...">value</fit:Field>
                    inside each trackpoint's <Extensions>.
-
-Requires: pip install fitparse
+```
+Requires: `pip install fitparse`
 
 Notes:
   * TCX has no native temperature element. Temperature is written as

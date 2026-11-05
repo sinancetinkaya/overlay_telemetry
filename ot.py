@@ -400,16 +400,21 @@ OPEN_METEO_FORECAST = "https://api.open-meteo.com/v1/forecast"
 OPEN_METEO_URLS = {"archive": OPEN_METEO_ARCHIVE, "forecast": OPEN_METEO_FORECAST}
 
 
-def _open_meteo_request(base_url, locations, start_date, end_date):
+WIND_VARIABLES = {"gust": "wind_gusts_10m", "mean": "wind_speed_10m"}
+
+
+def _open_meteo_request(base_url, locations, start_date, end_date, speed_variable="wind_gusts_10m"):
     """One Open-Meteo call for one or more (lat, lon) locations -> a list with one
     sorted [(utc_datetime, speed_kmh, from_deg), ...] series per location, in the
-    same order as `locations`."""
+    same order as `locations`. `speed_variable` is the Open-Meteo speed series to
+    use (wind_gusts_10m or wind_speed_10m); the direction is always the mean
+    wind direction, since Open-Meteo has no separate gust direction."""
     query = urllib.parse.urlencode({
         "latitude": ",".join(f"{lat:.4f}" for lat, _ in locations),
         "longitude": ",".join(f"{lon:.4f}" for _, lon in locations),
         "start_date": start_date.isoformat(),
         "end_date": end_date.isoformat(),
-        "hourly": "wind_speed_10m,wind_direction_10m",
+        "hourly": f"{speed_variable},wind_direction_10m",
         "wind_speed_unit": "kmh",
         "timezone": "GMT",
     }, safe=",")
@@ -428,7 +433,7 @@ def _open_meteo_request(base_url, locations, start_date, end_date):
         hourly = result.get("hourly") or {}
         series = []
         for ts, spd, deg in zip(hourly.get("time", []),
-                                hourly.get("wind_speed_10m", []),
+                                hourly.get(speed_variable, []),
                                 hourly.get("wind_direction_10m", [])):
             if spd is None or deg is None:
                 continue
@@ -439,8 +444,9 @@ def _open_meteo_request(base_url, locations, start_date, end_date):
     return all_series
 
 
-def _wind_field(locations, all_series):
-    return [{"lat": lat, "lon": lon, "series": series, "times": [row[0] for row in series]}
+def _wind_field(locations, all_series, gust):
+    return [{"lat": lat, "lon": lon, "series": series, "times": [row[0] for row in series],
+             "gust": gust}
             for (lat, lon), series in zip(locations, all_series)]
 
 
@@ -461,7 +467,7 @@ def pick_wind_locations(points, times, t_start, t_end, count=3, min_sep_m=1000.0
     return locations
 
 
-def fetch_wind_field(locations, t_start, t_end, source="auto"):
+def fetch_wind_field(locations, t_start, t_end, source="auto", speed_type="gust"):
     """Hourly 10 m wind (speed km/h, direction the wind blows FROM, degrees) for
     each (lat, lon) in `locations`, covering [t_start, t_end], from Open-Meteo.
 
@@ -469,19 +475,24 @@ def fetch_wind_field(locations, t_start, t_end, source="auto"):
             "forecast" - forecast API only (keeps ~3 months of past days)
             "auto"     - ERA5 archive when it fully covers the video, else the
                          forecast API.
-    Returns a list of {"lat", "lon", "series", "times"} (one per location), or
-    None on failure so the rest of the overlay still renders."""
+    speed_type: "gust" - wind_gusts_10m (maximum of the preceding hour)
+                "mean" - wind_speed_10m (instantaneous)
+    Returns a list of {"lat", "lon", "series", "times", "gust"} (one per location),
+    or None on failure so the rest of the overlay still renders."""
     utc = timezone.utc
     t0 = t_start.astimezone(utc)
     t1 = t_end.astimezone(utc)
     pad = timedelta(hours=1)
     order = ["archive", "forecast"] if source == "auto" else [source]
+    speed_variable = WIND_VARIABLES[speed_type]
+    gust = speed_type == "gust"
 
     best, last_error = None, None
     for name in order:
         try:
             all_series = _open_meteo_request(OPEN_METEO_URLS[name], locations,
-                                             (t0 - pad).date(), (t1 + pad).date())
+                                             (t0 - pad).date(), (t1 + pad).date(),
+                                             speed_variable)
         except (urllib.error.URLError, OSError, ValueError, KeyError) as error:
             last_error = f"{name}: {error}"
             continue
@@ -494,22 +505,24 @@ def fetch_wind_field(locations, t_start, t_end, source="auto"):
         # recent rides fail this and fall through to the forecast API in "auto").
         covers = first[0][0] <= t0 and first[-1][0] >= t1
         if covers:
-            print(f"  Wind source: Open-Meteo {name} API "
+            print(f"  Wind source: Open-Meteo {name} API, {speed_variable} "
                   f"({len(first)} hourly samples, {len(locations)} location(s))")
-            return _wind_field(locations, all_series)
+            return _wind_field(locations, all_series, gust)
         best = best or (name, all_series)
     if best:
         print(f"  WARNING: Open-Meteo {best[0]} data only partly covers the video; "
               "values are held constant outside it.")
-        return _wind_field(locations, best[1])
+        return _wind_field(locations, best[1], gust)
     print(f"  WARNING: could not get wind data ({last_error}). "
           "Wind box will be omitted. Check your internet connection.")
     return None
 
 
-def wind_at(series, times, t):
-    """(speed_kmh, from_deg) at time t: speed interpolated linearly, direction
-    interpolated around the circle (so 350 deg -> 10 deg goes via north)."""
+def wind_at(series, times, t, gust=False):
+    """(speed_kmh, from_deg) at time t: direction interpolated around the circle
+    (so 350 deg -> 10 deg goes via north). Speed is interpolated linearly, except
+    for gusts: Open-Meteo's gust value at HH:00 is the maximum of the hour BEFORE
+    it, so every moment in (HH-1:00, HH:00] takes that HH:00 value as is."""
     if not series:
         return None
     i = bisect.bisect_right(times, t)
@@ -520,7 +533,9 @@ def wind_at(series, times, t):
     (ta, sa, da), (tb, sb, db) = series[i - 1], series[i]
     span = (tb - ta).total_seconds()
     f = (t - ta).total_seconds() / span if span > 0 else 0.0
-    speed = sa + (sb - sa) * f
+    # gust: the sample that closes the hour t falls in (at exactly HH:00 that is
+    # HH:00 itself, a moment later it is the next one).
+    speed = series[bisect.bisect_left(times, t)][1] if gust else sa + (sb - sa) * f
     x = (1 - f) * math.sin(math.radians(da)) + f * math.sin(math.radians(db))
     y = (1 - f) * math.cos(math.radians(da)) + f * math.cos(math.radians(db))
     return speed, math.degrees(math.atan2(x, y)) % 360.0
@@ -534,7 +549,7 @@ def wind_at_position(field, lat, lon, t):
         return None
     samples = []
     for loc in field:
-        w = wind_at(loc["series"], loc["times"], t)
+        w = wind_at(loc["series"], loc["times"], t, loc.get("gust", False))
         if w is not None:
             samples.append((haversine(lat, lon, loc["lat"], loc["lon"]), w))
     if not samples:
@@ -673,7 +688,7 @@ HR_PCT_COLOR_STOPS = [
 def render_frame(
     data, w, h, map_ctx=None, show_speed=True, show_grade=True,
     show_hr=True, show_latlong=True, show_timestamp=True, speed_type="speed",
-    max_hr=None, wind=None, wind_arrow="to", wind_up="heading"):
+    max_hr=None, wind=None, wind_arrow="to", wind_up="heading", wind_gust=False):
 
     img = Image.new("RGBA", (w, h), (0, 0, 0, 0))
     d = ImageDraw.Draw(img)
@@ -858,7 +873,7 @@ def render_frame(
         strip_y0 = strip_y1 - strip_h
         d.rounded_rectangle((wx0, strip_y0, wx1, strip_y1), radius=int(12 * scale),
                             corners=(False, False, True, True), fill=(0, 0, 0, 150))
-        d.text(((wx0 + wx1) / 2, strip_y0 + strip_h / 2), f"{wind_speed:.1f} km/h",
+        d.text(((wx0 + wx1) / 2, strip_y0 + strip_h / 2), (f"Gust {wind_speed:.1f} km/h" if wind_gust else f"{wind_speed:.1f} km/h"),
                font=f_small, fill=(255, 255, 255, 230), anchor="mm")
 
     # lat/lon: now top-left
@@ -981,6 +996,11 @@ def build_parser():
                           "'forecast' (Open-Meteo forecast API's past data) or 'auto' "
                           "(archive when it fully covers the video, otherwise forecast). "
                           "Default: auto.")
+    ap.add_argument("--wind-speed-type", choices=["gust", "mean"], default="gust",
+                     help="Speed shown in the wind box: 'gust' (wind gusts at 10 m, the "
+                          "maximum of the hour; labelled 'Gust') or 'mean' (wind speed at "
+                          "10 m). The arrow always uses the mean wind direction. "
+                          "Default: gust.")
     ap.add_argument("--wind-points", type=int, default=3,
                      help="How many locations along the video's part of the track to "
                           "fetch wind for; the wind at your GPS position is blended from "
@@ -1173,7 +1193,8 @@ def main():
               f"for {len(locations)} location(s)...")
         for lat, lon in locations:
             print(f"  {lat:.4f}, {lon:.4f}")
-        wind_field = fetch_wind_field(locations, w_start, w_end, source=args.wind_source)
+        wind_field = fetch_wind_field(locations, w_start, w_end, source=args.wind_source,
+                                      speed_type=args.wind_speed_type)
         if wind_field:
             for label, t in (("start", w_start), ("end", w_end)):
                 p = sample_at(points, times, t)
@@ -1181,7 +1202,7 @@ def main():
                 if w:
                     heading = (f", route heading {p['heading']:.0f}\u00b0"
                                if p.get("heading") is not None else "")
-                    print(f"  Wind at video {label}: {w[0]:.1f} km/h from {w[1]:.0f}\u00b0 "
+                    print(f"  Wind {args.wind_speed_type} at video {label}: {w[0]:.1f} km/h from {w[1]:.0f}\u00b0 "
                           f"(arrow to {(w[1] + 180) % 360:.0f}\u00b0{heading})")
 
     tmpdir = tempfile.mkdtemp(prefix="telemetry_overlay_")
@@ -1219,6 +1240,7 @@ def main():
                 speed_type=args.speed_type,
                 max_hr=args.max_hr,
                 wind=wind_now, wind_arrow=args.wind_arrow, wind_up=args.wind_up,
+                wind_gust=args.wind_speed_type == "gust",
             )
             frame.save(os.path.join(frames_dir, f"frame_{i:06d}.png"))
             if i % 50 == 0:

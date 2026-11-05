@@ -97,6 +97,7 @@ time. Use `--smooth-window` to average speed and gradient over a time window.
 | `--wind-points N` | `3` | Locations along the video's part of the track to fetch wind for |
 | `--wind-arrow to\|from` | `to` | Arrow points where the wind blows **to**, or where it comes **from** |
 | `--wind-up heading\|north` | `heading` | What points up on the compass: your direction of travel, or true north |
+| `--wind-speed-type gust\|mean` | `gust` | Speed shown in the wind box: hourly maximum gust (labelled "Gust") or mean wind speed |
 
 # ot.conf
 

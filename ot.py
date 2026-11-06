@@ -762,7 +762,7 @@ def render_frame(
         
         grade_sign = "+" if data["grade"] >= 0 else ""
         grade_color = interpolate_color(GRADE_COLOR_STOPS, data["grade"])
-        bottom_panel(1, "Gradient", f"{grade_sign}{data['grade']:.1f}", "%", f_big,
+        bottom_panel(1, "Grade", f"{grade_sign}{data['grade']:.1f}", "%", f_big,
                      value_color=(*grade_color, 255))
 
     if show_hr:
